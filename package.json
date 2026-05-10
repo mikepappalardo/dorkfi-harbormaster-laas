@@ -1,0 +1,18 @@
+{
+  "name": "dorkfi-harbormaster-laas",
+  "version": "1.0.0",
+  "description": "Liquidation Protection as a Service for DorkFi",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs",
+    "api": "node api.mjs",
+    "monitor": "node monitor.mjs"
+  },
+  "dependencies": {
+    "algosdk": "^3.0.0",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}
