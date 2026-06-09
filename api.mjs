@@ -9,13 +9,19 @@
  */
 
 import express from 'express';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { existsSync } from 'fs';
 import { config } from './lib/env.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 import {
   registerWallet,
   deregisterWallet,
   getWallet,
   loadRegistry,
 } from './lib/registry.mjs';
+import { getSession, markSessionUsed } from './lib/sessions.mjs';
 import { getHealthFactor } from './lib/dorkfi.mjs';
 import { log } from './lib/notify.mjs';
 
@@ -117,6 +123,36 @@ app.get('/wallets', requireOperator, (req, res) => {
   res.json(loadRegistry());
 });
 
+// GET /repay/:token — fetch pre-built transaction for signing page
+app.get('/repay/:token', (req, res) => {
+  const session = getSession(req.params.token);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found or expired' });
+  }
+  if (session.used) {
+    return res.status(410).json({ error: 'Session already used' });
+  }
+  res.json({
+    txnB64:        session.txnB64,
+    walletAddress: session.walletAddress,
+    chain:         session.chain,
+    poolId:        session.poolId,
+    symbol:        session.symbol,
+    repayUsd:      session.repayUsd,
+    currentHF:     session.currentHF,
+    expiresAt:     session.expiresAt,
+  });
+});
+
+// POST /repay/:token/complete — mark session used after successful submission
+app.post('/repay/:token/complete', (req, res) => {
+  const session = getSession(req.params.token);
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
+  markSessionUsed(req.params.token);
+  log(`Repay completed via signing page | wallet=${session.walletAddress.slice(0,8)} chain=${session.chain}`);
+  res.json({ ok: true });
+});
+
 // GET /health
 app.get('/health', (req, res) => {
   res.json({
@@ -128,6 +164,15 @@ app.get('/health', (req, res) => {
 });
 
 export function startApi() {
+  // Serve the signing app at /repay/* (static files from sign/dist)
+  const signDist = join(__dirname, 'public', 'sign');
+  if (existsSync(signDist)) {
+    app.use('/sign', express.static(signDist));
+    // Catch-all for SPA routing under /sign
+    app.get('/sign/*', (_, res) => res.sendFile(join(signDist, 'index.html')));
+    log(`Serving signing app from ${signDist}`);
+  }
+
   app.listen(config.port, () => {
     log(`Harbormaster API listening on port ${config.port}`);
   });
