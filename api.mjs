@@ -1,12 +1,11 @@
 /**
- * DorkFi Harbormaster LaaS — Registration API
+ * DorkFi Harbormaster — Registration API (Alert Mode)
  *
- * POST /register          — register a wallet for protection
- * DELETE /register/:addr  — remove a wallet
- * GET  /status/:addr      — get wallet status + fee balance
- * GET  /wallets           — list all registered wallets (operator only)
- * POST /deposit/:addr     — record a fee deposit (manual, off-chain payment)
- * GET  /health            — service health check
+ * POST   /register         — register a wallet for monitoring + alerts
+ * DELETE /register/:addr   — remove a wallet
+ * GET    /status/:addr     — live HF + registration status
+ * GET    /wallets          — list all wallets (operator only)
+ * GET    /health           — service health check
  */
 
 import express from 'express';
@@ -16,7 +15,6 @@ import {
   deregisterWallet,
   getWallet,
   loadRegistry,
-  creditFeeDeposit,
 } from './lib/registry.mjs';
 import { getHealthFactor } from './lib/dorkfi.mjs';
 import { log } from './lib/notify.mjs';
@@ -24,7 +22,6 @@ import { log } from './lib/notify.mjs';
 const app = express();
 app.use(express.json());
 
-// Simple operator auth via header
 function requireOperator(req, res, next) {
   const key = req.headers['x-operator-key'];
   if (!key || key !== process.env.OPERATOR_KEY) {
@@ -39,30 +36,30 @@ app.post('/register', async (req, res) => {
     const { address, label, chains, hf_floor, contact } = req.body;
 
     if (!address) return res.status(400).json({ error: 'address required' });
-    if (address.length < 58) return res.status(400).json({ error: 'invalid address' });
+    if (address.length < 58) return res.status(400).json({ error: 'invalid Algorand/Voi address' });
 
     const entry = registerWallet({ address, label, chains, hf_floor, contact });
-
     log(`Registered: ${address} (${label || 'unlabeled'})`);
 
     res.json({
       ok: true,
-      message: 'Wallet registered for Harbormaster protection',
+      message: 'Wallet registered — Harbormaster will alert you when HF drops below threshold',
       wallet: {
         address:       entry.address,
         label:         entry.label,
         chains:        entry.chains,
         hf_floor:      entry.hf_floor,
-        fee_deposit:   entry.fee_deposit_usd,
+        contact:       entry.contact,
         registered_at: entry.registered_at,
       },
       next_steps: [
-        `Fund your fee deposit via POST /deposit/${address} (minimum $5 USDC recommended)`,
-        `Protection activates immediately once fee deposit is confirmed`,
-        `Check status at GET /status/${address}`,
+        `Alerts will fire when HF < ${entry.hf_floor ?? 1.05}`,
+        `Each alert includes a direct link to repay on dork.fi`,
+        contact
+          ? `Alerts will be sent to your Telegram (contact: ${entry.contact})`
+          : `No contact set — alerts go to operator only. Add contact via re-registering with contact field`,
+        `Check live status at GET /status/${address}`,
       ],
-      service_fee: `${config.feeRate * 100}% of debt repaid per protection event`,
-      trigger_hf:  config.triggerHF,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -72,10 +69,9 @@ app.post('/register', async (req, res) => {
 // DELETE /register/:address
 app.delete('/register/:address', async (req, res) => {
   try {
-    const { address } = req.params;
-    deregisterWallet(address);
-    log(`Deregistered: ${address}`);
-    res.json({ ok: true, message: 'Wallet removed from protection' });
+    deregisterWallet(req.params.address);
+    log(`Deregistered: ${req.params.address}`);
+    res.json({ ok: true, message: 'Wallet removed from monitoring' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -84,17 +80,18 @@ app.delete('/register/:address', async (req, res) => {
 // GET /status/:address
 app.get('/status/:address', async (req, res) => {
   try {
-    const { address } = req.params;
-    const wallet = getWallet(address);
-
+    const wallet = getWallet(req.params.address);
     if (!wallet) return res.status(404).json({ error: 'Wallet not registered' });
 
-    // Fetch live HF for both chains
     const hfData = {};
     for (const chain of wallet.chains ?? ['voi', 'algorand']) {
-      const result = await getHealthFactor(address, chain);
+      const result = await getHealthFactor(req.params.address, chain);
       hfData[chain] = result?.hf ?? null;
     }
+
+    const lowestHF = Object.values(hfData).filter(Boolean).reduce(
+      (min, v) => Math.min(min, v), Infinity
+    );
 
     res.json({
       address:           wallet.address,
@@ -102,39 +99,13 @@ app.get('/status/:address', async (req, res) => {
       active:            wallet.active,
       chains:            wallet.chains,
       hf_floor:          wallet.hf_floor,
-      trigger_hf:        config.triggerHF,
-      fee_deposit_usd:   wallet.fee_deposit_usd,
-      fees_charged_usd:  wallet.fees_charged_usd,
+      contact:           wallet.contact,
       protections_count: wallet.protections_count,
       registered_at:     wallet.registered_at,
       current_hf:        hfData,
-      warning: wallet.fee_deposit_usd <= 0
-        ? 'Fee deposit exhausted — protection suspended. Fund via POST /deposit/:address'
-        : null,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /deposit/:address — operator records a fee deposit
-app.post('/deposit/:address', requireOperator, async (req, res) => {
-  try {
-    const { address } = req.params;
-    const { amount_usd } = req.body;
-
-    if (!amount_usd || amount_usd <= 0) {
-      return res.status(400).json({ error: 'amount_usd must be positive' });
-    }
-
-    const wallet = creditFeeDeposit(address, parseFloat(amount_usd));
-    log(`Fee deposit: ${address} +$${amount_usd} (balance: $${wallet.fee_deposit_usd})`);
-
-    res.json({
-      ok: true,
-      address,
-      fee_deposit_usd:  wallet.fee_deposit_usd,
-      active:           wallet.active,
+      status:            lowestHF < 1.02 ? 'CRITICAL'
+                       : lowestHF < (wallet.hf_floor ?? 1.05) ? 'AT_RISK'
+                       : 'SAFE',
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -143,23 +114,21 @@ app.post('/deposit/:address', requireOperator, async (req, res) => {
 
 // GET /wallets — operator only
 app.get('/wallets', requireOperator, (req, res) => {
-  const registry = loadRegistry();
-  res.json(registry);
+  res.json(loadRegistry());
 });
 
 // GET /health
 app.get('/health', (req, res) => {
   res.json({
-    status:     'ok',
-    service:    'DorkFi Harbormaster LaaS',
-    trigger_hf: config.triggerHF,
-    fee_rate:   config.feeRate,
-    uptime_s:   Math.floor(process.uptime()),
+    status:   'ok',
+    service:  'DorkFi Harbormaster (alert mode)',
+    mode:     'alert — no on-chain execution',
+    uptime_s: Math.floor(process.uptime()),
   });
 });
 
 export function startApi() {
   app.listen(config.port, () => {
-    log(`Harbormaster LaaS API listening on port ${config.port}`);
+    log(`Harbormaster API listening on port ${config.port}`);
   });
 }

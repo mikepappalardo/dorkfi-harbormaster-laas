@@ -1,32 +1,44 @@
 /**
- * DorkFi Harbormaster LaaS — Monitor
+ * DorkFi Harbormaster — Health Monitor (Alert Mode)
  *
- * Polls health factors for all registered wallets.
- * When HF < trigger threshold, executes repay_on_behalf
- * and charges the 0.1% service fee.
+ * Monitors registered wallets and fires Telegram alerts with
+ * a pre-built action link when HF drops below threshold.
+ * No on-chain execution — user taps the link and signs in their wallet.
  */
 
-import algosdk from 'algosdk';
 import { config } from './lib/env.mjs';
-import { getHealthFactor, getMarkets, repayOnBehalf } from './lib/dorkfi.mjs';
-import { getActiveWallets, chargeFee } from './lib/registry.mjs';
+import { getHealthFactor } from './lib/dorkfi.mjs';
+import { getActiveWallets } from './lib/registry.mjs';
 import { sendTelegram, log, hfEmoji } from './lib/notify.mjs';
 
-// Track last action per wallet to prevent double-execution
-const lastAction = {};
-const ACTION_COOLDOWN_MS = 10 * 60 * 1000; // 10 min between repays per wallet
+const POLL_INTERVAL_MS   = 60_000;  // 1 min between full sweeps
+const ALERT_COOLDOWN_MS  = 5 * 60_000;  // 5 min between repeat alerts per wallet+chain
+const CRITICAL_THRESHOLD = 1.02;        // escalate to CRITICAL below this
 
-function getServiceAccount() {
-  if (!config.serviceMnemonic) throw new Error('SERVICE_MNEMONIC not set in .env');
-  return algosdk.mnemonicToSecretKey(config.serviceMnemonic);
+// Track last alert time per wallet+chain to prevent spam
+const lastAlerted = {};
+
+// ── Deep link builder ──────────────────────────────────────────────────────
+/**
+ * Build a dork.fi repay URL with pre-filled params.
+ * Falls back to the main app if the market/amount can't be determined.
+ */
+function buildRepayLink(chain, address, repay) {
+  const base = `https://dork.fi`;
+  if (!repay?.symbol) return base;
+  const params = new URLSearchParams({
+    action:  'repay',
+    chain,
+    wallet:  address,
+    market:  repay.symbol,
+    amount:  repay.repayUsd.toFixed(2),
+  });
+  return `${base}?${params.toString()}`;
 }
 
-/**
- * Find the largest borrowed position and calculate repay amount.
- * Repays enough to push HF back to 1.2 (safe buffer above trigger).
- */
-function calcRepayAmount(borrows, collateral, debt, hf) {
-  if (!borrows?.length || !debt) return null;
+// ── Repay calculation ──────────────────────────────────────────────────────
+function calcRepayTarget(borrows, hf) {
+  if (!borrows?.length) return null;
 
   const sorted = [...borrows].sort((a, b) => {
     const aUsd = parseFloat(a.borrow_value_usd ?? a.value_usd ?? 0);
@@ -38,154 +50,105 @@ function calcRepayAmount(borrows, collateral, debt, hf) {
   const debtUsd = parseFloat(top.borrow_value_usd ?? top.value_usd ?? 0);
   if (!debtUsd) return null;
 
-  // Repay enough to get from current HF to target of 1.2
-  // ΔRepay ≈ (targetHF - currentHF) / targetHF × totalDebt
-  const TARGET_HF = 1.2;
-  const repayFraction = Math.min(0.5, Math.max(0.05, (TARGET_HF - hf) / TARGET_HF));
-  const repayUsd = debtUsd * repayFraction;
+  // How much to repay to restore HF to 1.25 (safe buffer)
+  const TARGET_HF      = 1.25;
+  const repayFraction  = Math.min(0.6, Math.max(0.05, (TARGET_HF - hf) / TARGET_HF));
+  const repayUsd       = debtUsd * repayFraction;
 
   return {
-    symbol:        top.symbol ?? top.asset ?? 'Unknown',
-    marketId:      top.market_id ?? top.marketId ?? null,
-    decimals:      top.decimals ?? 6,
+    symbol:       top.symbol ?? top.asset ?? 'debt',
     repayFraction,
     repayUsd,
-    debtUsd,
-    rawAmount:     top.borrow_amount ?? top.amount ?? null,
-    poolId:        top.pool_id ?? null,
+    totalDebtUsd: debtUsd,
   };
 }
 
-async function executeProtection(wallet, chain, hf, borrows, collateral, debt) {
-  const key = `${wallet.address}:${chain}`;
-  const now = Date.now();
+// ── Alert sender ───────────────────────────────────────────────────────────
+async function sendAlert(wallet, chain, hf, repay) {
+  const key      = `${wallet.address}:${chain}`;
+  const now      = Date.now();
+  const lastTime = lastAlerted[key] || 0;
 
-  if (lastAction[key] && now - lastAction[key] < ACTION_COOLDOWN_MS) {
-    log(`  [${key}] Cooldown active — skipping execution`);
+  if (now - lastTime < ALERT_COOLDOWN_MS) {
+    log(`  [${key}] Alert cooldown active — suppressing`);
     return;
   }
 
-  const repay = calcRepayAmount(borrows, collateral, debt, hf);
-  if (!repay || !repay.marketId) {
-    log(`  [${key}] Could not determine repay target — alerting only`);
-    await sendTelegram(
-      `⚠️ *Harbormaster LaaS — Manual Action Required*\n\nWallet: \`${wallet.address.slice(0,8)}...\`\nChain: ${chain}\nHF: ${hf?.toFixed(4)}\n\nCould not auto-repay — insufficient position data. Please act immediately.`,
-      wallet.contact
-    );
-    return;
+  const isCritical = hf < CRITICAL_THRESHOLD;
+  const urgency    = isCritical ? '🚨 *CRITICAL*' : '⚠️ *WARNING*';
+  const repayLink  = buildRepayLink(chain, wallet.address, repay);
+  const shortAddr  = wallet.address.slice(0, 8) + '...' + wallet.address.slice(-4);
+  const label      = wallet.label || shortAddr;
+
+  let msg = `${urgency} — Liquidation Risk Detected\n\n`;
+  msg += `*Wallet:* ${label} (\`${shortAddr}\`)\n`;
+  msg += `*Chain:* ${chain.charAt(0).toUpperCase() + chain.slice(1)}\n`;
+  msg += `*Health Factor:* ${hfEmoji(hf)} \`${hf.toFixed(4)}\` (threshold: ${wallet.hf_floor ?? 1.05})\n\n`;
+
+  if (repay) {
+    msg += `*Recommended Action:*\n`;
+    msg += `Repay ~${(repay.repayFraction * 100).toFixed(0)}% of ${repay.symbol} `;
+    msg += `(*$${repay.repayUsd.toFixed(2)}* of $${repay.totalDebtUsd.toFixed(2)} total)\n`;
+    msg += `This restores your HF to ~1.25\n\n`;
   }
 
-  log(`  [${key}] Executing repay: ${(repay.repayFraction * 100).toFixed(1)}% of ${repay.symbol} ($${repay.repayUsd.toFixed(2)})`);
-
-  try {
-    const serviceAccount = getServiceAccount();
-
-    // Calculate base units for repay
-    const repayBaseUnits = BigInt(
-      Math.floor((repay.rawAmount ?? 0) * repay.repayFraction)
-    );
-
-    if (repayBaseUnits <= 0n) {
-      log(`  [${key}] Repay amount too small — skipping`);
-      return;
-    }
-
-    const poolId = repay.poolId ?? (chain === 'voi' ? 47139778 : 3333688282);
-
-    const txid = await repayOnBehalf({
-      chain,
-      poolId,
-      marketId:        repay.marketId,
-      borrowerAddress: wallet.address,
-      amountBaseUnits: repayBaseUnits,
-      serviceAccount,
-    });
-
-    lastAction[key] = now;
-
-    // Charge fee: 0.1% of repay value
-    const feeUsd = repay.repayUsd * config.feeRate;
-    chargeFee(wallet.address, feeUsd);
-
-    log(`  [${key}] Protection executed. Tx: ${txid} | Fee charged: $${feeUsd.toFixed(4)}`);
-
-    await sendTelegram(
-      [
-        `🛡️ *Harbormaster LaaS — Position Protected*`,
-        ``,
-        `Wallet: \`${wallet.address.slice(0,8)}...${wallet.address.slice(-4)}\``,
-        `Chain: ${chain.charAt(0).toUpperCase() + chain.slice(1)}`,
-        `HF before: ${hf?.toFixed(4)} → target: 1.20`,
-        `Repaid: ${(repay.repayFraction * 100).toFixed(1)}% of ${repay.symbol} ($${repay.repayUsd.toFixed(2)})`,
-        `Service fee: $${feeUsd.toFixed(4)} (0.1%)`,
-        `Tx: \`${txid}\``,
-      ].join('\n'),
-      wallet.contact
-    );
-
-    // Notify operator too
-    await sendTelegram(
-      `🛡️ *Protection executed*\n${wallet.label} on ${chain}\nTx: \`${txid}\` | Fee: $${feeUsd.toFixed(4)}`
-    );
-
-  } catch (err) {
-    log(`  [${key}] Execution failed: ${err.message}`);
-    await sendTelegram(
-      `🚨 *Harbormaster LaaS — Execution Failed*\n\nWallet: \`${wallet.address.slice(0,8)}...\`\nChain: ${chain}\nHF: ${hf?.toFixed(4)}\nError: ${err.message}\n\n⚠️ Manual intervention required.`,
-      wallet.contact
-    );
+  if (isCritical) {
+    msg += `⏰ *Act immediately* — liquidation imminent\\.\n\n`;
+  } else {
+    msg += `You have some time, but act soon to stay safe\\.\n\n`;
   }
+
+  msg += `[Repay on dork\\.fi →](${repayLink})`;
+
+  // Send to per-user contact if set, else operator fallback
+  const target = wallet.contact || config.telegramChatId;
+  await sendTelegram(msg, target);
+  lastAlerted[key] = now;
+
+  log(`  [${key}] Alert sent — HF=${hf.toFixed(4)} repay=$${repay?.repayUsd?.toFixed(2) ?? '?'}`);
 }
 
-async function runCycle() {
+// ── Main monitor loop ──────────────────────────────────────────────────────
+async function sweep() {
   const wallets = getActiveWallets();
   if (!wallets.length) {
-    log('No active wallets registered');
+    log('No registered wallets — waiting...');
     return;
   }
 
-  log(`Checking ${wallets.length} wallet(s)...`);
-
   for (const wallet of wallets) {
-    for (const chain of wallet.chains ?? ['voi', 'algorand']) {
+    const chains = wallet.chains || ['voi', 'algorand'];
+    const floor  = wallet.hf_floor ?? 1.05;
+
+    for (const chain of chains) {
       try {
         const result = await getHealthFactor(wallet.address, chain);
-        if (!result) { log(`  ${wallet.label} [${chain}] — no data`); continue; }
+        if (!result) continue;
 
-        const { hf, collateral, debt, borrows } = result;
-        log(`${hfEmoji(hf)} ${wallet.label} [${chain}] HF: ${hf?.toFixed(4) ?? 'N/A'}`);
-
+        const { hf, borrows } = result;
         if (!hf || isNaN(hf) || hf <= 0) continue;
 
-        // Execute protection
-        if (hf < config.triggerHF) {
-          log(`  ⚡ HF ${hf.toFixed(4)} < trigger ${config.triggerHF} — protecting`);
-          await executeProtection(wallet, chain, hf, borrows, collateral, debt);
-        }
+        log(`  ${wallet.label || wallet.address.slice(0,8)} [${chain}] HF=${hf.toFixed(4)} ${hfEmoji(hf)}`);
 
-        // Early warning: 15% above trigger
-        else if (hf < config.triggerHF * 1.15) {
-          log(`  ⚠️  Approaching trigger — HF: ${hf.toFixed(4)}`);
-          const key = `${wallet.address}:${chain}:warn`;
-          const last = lastAction[key] ?? 0;
-          if (Date.now() - last > 60 * 60 * 1000) { // warn once per hour
-            await sendTelegram(
-              `⚠️ *Harbormaster LaaS — Early Warning*\n\nWallet: \`${wallet.address.slice(0,8)}...\`\nChain: ${chain}\nHF: ${hf.toFixed(4)} — approaching protection threshold of ${config.triggerHF}\n\nConsider adding collateral or repaying debt.`,
-              wallet.contact
-            );
-            lastAction[key] = Date.now();
-          }
+        if (hf < floor) {
+          const repay = calcRepayTarget(borrows, hf);
+          await sendAlert(wallet, chain, hf, repay);
         }
-
       } catch (err) {
-        log(`  Error checking ${wallet.label} [${chain}]: ${err.message}`);
+        log(`  [${wallet.address}:${chain}] Error: ${err.message}`);
       }
+
+      // Pace requests
+      await new Promise(r => setTimeout(r, 500));
     }
   }
 }
 
 export async function startMonitor() {
-  log(`Harbormaster LaaS monitor starting | Trigger HF: ${config.triggerHF} | Poll: ${config.pollInterval}s`);
-  await runCycle();
-  setInterval(runCycle, config.pollInterval * 1000);
+  log('Harbormaster monitor started (alert mode)');
+  log(`Poll interval: ${POLL_INTERVAL_MS / 1000}s | Alert cooldown: ${ALERT_COOLDOWN_MS / 60000}m`);
+
+  // Run immediately then on interval
+  await sweep();
+  setInterval(sweep, POLL_INTERVAL_MS);
 }
